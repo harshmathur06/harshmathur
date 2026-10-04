@@ -1,0 +1,6 @@
+.naukri-browser/
+.env
+data/seen_invites.json
+data/debug/
+__pycache__/
+*.pyc
