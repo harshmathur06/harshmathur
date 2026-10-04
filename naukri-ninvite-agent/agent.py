@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
+from typing import Optional
 
 from playwright.async_api import async_playwright
 
@@ -43,7 +44,7 @@ def job_key(*parts: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
-def load_seen() -> set[str]:
+def load_seen() -> set:
     if not STATE_FILE.exists():
         return set()
     try:
@@ -52,7 +53,7 @@ def load_seen() -> set[str]:
         return set()
 
 
-def save_seen(keys: set[str]) -> None:
+def save_seen(keys: set) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(
         json.dumps(
@@ -158,8 +159,6 @@ async def open_jobs_and_recommended(page):
 
     print("Clicked Jobs.")
 
-    # Naukri's Jobs menu contains Recommended jobs, NVites, Application status,
-    # and Saved jobs. Only Recommended jobs is used by this agent.
     recommended = await click_text(page, ["Recommended jobs"])
     if not recommended:
         try:
@@ -209,16 +208,18 @@ async def discover(page):
 def looks_like_job_card(text: str) -> bool:
     low = text.lower()
 
-    # The screenshot shows each recommendation containing a title, company,
-    # experience, salary/location and a posted-age line such as "1 Day Ago".
     has_posted = bool(
         re.search(
             r"\b(today|yesterday|\d+\s*days?\s*ago|\d+\s*day\s*ago)\b",
             low,
         )
     )
-    has_experience = bool(re.search(r"\b\d+\s*[-–]\s*\d+\s*yrs?\b|\byrs?\b", low))
-    has_salary = bool(re.search(r"\b(lpa|lakhs?|lacs?|pa)\b|₹|rs\.?\s*\d", low))
+    has_experience = bool(
+        re.search(r"\b\d+\s*[-–]\s*\d+\s*yrs?\b|\byrs?\b", low)
+    )
+    has_salary = bool(
+        re.search(r"\b(lpa|lakhs?|lacs?|pa)\b|₹|rs\.?\s*\d", low)
+    )
     has_job_signal = bool(
         re.search(
             r"\b(product manager|program manager|business analyst|software|"
@@ -228,12 +229,12 @@ def looks_like_job_card(text: str) -> bool:
         )
     )
 
-    return len(text) >= 80 and has_posted and (has_experience or has_salary or has_job_signal)
+    return len(text) >= 80 and has_posted and (
+        has_experience or has_salary or has_job_signal
+    )
 
 
 async def collect_job_blocks(page):
-    # Do not depend on a particular href/class. Naukri can render recommendation
-    # cards as divs with client-side click handlers and no job URL on the card.
     candidates = page.locator(
         "article, li, [role='listitem'], [role='article'], "
         "div[class*='job'], div[class*='Job'], div[class*='card'], div[class*='Card'], "
@@ -253,8 +254,6 @@ async def collect_job_blocks(page):
         if not looks_like_job_card(txt):
             continue
 
-        # Prefer the smallest useful card. Nested divs often repeat the same
-        # content, so exact text deduplication removes those duplicates.
         key = txt.lower()
         if key in seen:
             continue
@@ -275,8 +274,6 @@ async def collect_job_blocks(page):
 
         blocks.append((txt, source_url))
 
-    # Fallback: scan all divs for the visible "posted" + job metadata pattern.
-    # This handles the current Naukri layout even if its CSS class names change.
     if not blocks:
         all_divs = page.locator("div")
         count = await all_divs.count()
@@ -312,12 +309,11 @@ async def collect_job_blocks(page):
     return blocks
 
 
-def parse_job_card(txt: str, source_url: str) -> Job | None:
+def parse_job_card(txt: str, source_url: str) -> Optional[Job]:
     lines = [norm(x) for x in txt.splitlines() if norm(x)]
     if not lines:
         return None
 
-    # Strip obvious UI-only lines before choosing the title.
     ignored = {"hide", "save", "apply", "view all"}
     title = next((x for x in lines if x.lower() not in ignored), lines[0])
 
@@ -366,10 +362,9 @@ def parse_job_card(txt: str, source_url: str) -> Job | None:
     )
 
 
-async def extract_jobs(page) -> list[Job]:
+async def extract_jobs(page) -> list:
     all_blocks = []
 
-    # Capture currently visible cards, then scroll so lazy-loaded cards appear.
     for _ in range(12):
         blocks = await collect_job_blocks(page)
         all_blocks.extend(blocks)
@@ -387,7 +382,6 @@ async def extract_jobs(page) -> list[Job]:
         if job:
             jobs.append(job)
 
-    # Final deduplication by job key.
     deduped = {}
     for job in jobs:
         deduped[job.key] = job
@@ -404,7 +398,7 @@ async def extract_jobs(page) -> list[Job]:
     return jobs
 
 
-def send_email(jobs: list[Job]):
+def send_email(jobs: list):
     host = os.environ["SMTP_HOST"]
     port = int(os.getenv("SMTP_PORT", "465"))
     username = os.environ["SMTP_USERNAME"]
@@ -468,8 +462,6 @@ async def main(discover_only=False):
 
             print(f"Found {len(jobs)} job listing(s); {len(new_jobs)} new.")
 
-            # First run: send the complete current list.
-            # Later runs: send only jobs not seen before.
             send_email(new_jobs if seen else jobs)
 
             seen.update(x.key for x in jobs)
