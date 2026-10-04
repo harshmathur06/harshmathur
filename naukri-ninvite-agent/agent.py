@@ -10,7 +10,10 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+
+load_dotenv()
 
 BASE_URL = "https://www.naukri.com/"
 PROFILE_DIR = Path(os.getenv("NAUKRI_PROFILE_DIR", ".naukri-browser"))
@@ -399,10 +402,27 @@ async def extract_jobs(page) -> list:
 
 
 def send_email(jobs: list):
-    host = os.environ["SMTP_HOST"]
+    host = os.environ.get("SMTP_HOST", "")
     port = int(os.getenv("SMTP_PORT", "465"))
-    username = os.environ["SMTP_USERNAME"]
-    password = os.environ["SMTP_PASSWORD"]
+    username = os.environ.get("SMTP_USERNAME", "")
+    password = os.environ.get("SMTP_PASSWORD", "")
+
+    missing = [
+        name
+        for name, value in [
+            ("SMTP_HOST", host),
+            ("SMTP_USERNAME", username),
+            ("SMTP_PASSWORD", password),
+        ]
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Email configuration is missing: "
+            + ", ".join(missing)
+            + ". Create the local .env file as described in README.md. "
+            "Do not put the .env file in GitHub."
+        )
 
     if jobs:
         subject = f"Naukri: {len(jobs)} job(s) in Recommended Jobs"
