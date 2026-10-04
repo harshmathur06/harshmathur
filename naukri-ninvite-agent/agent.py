@@ -91,32 +91,53 @@ async def wait_for_login(page):
 
 
 async def open_ninvite(page):
-    await click_text(page, ["Jobs", "Jobs & Responses"])
+    # Naukri's authenticated navigation can differ by account/session and can be
+    # rendered as buttons, links, menus, or cards. First expose the live UI.
+    await page.wait_for_timeout(2500)
 
+    # Try the common Jobs entry points.
+    await click_text(page, [
+        "Jobs", "Jobs & Responses", "My Jobs", "Job Responses"
+    ])
+
+    await page.wait_for_timeout(1500)
+
+    # Try visible NInvite variants.
     clicked = await click_text(page, [
-        "NInvite", "NVite", "N Invites",
-        "NInvite list", "Invites", "Recruiter Invites"
+        "NInvite", "NVite", "N Invites", "NInvite list",
+        "NInvite List", "Invites", "Recruiter Invites",
+        "Recruiter Invitations", "Invitations"
     ])
     if clicked:
         return
 
+    # Try links/buttons whose visible text contains an invite-like term.
     for locator in [
-        page.locator("a").filter(has_text=re.compile(r"n.?vite|invite", re.I)),
-        page.locator("button").filter(has_text=re.compile(r"n.?vite|invite", re.I)),
+        page.locator("a").filter(has_text=re.compile(r"n.?vite|invite|invitation", re.I)),
+        page.locator("button").filter(has_text=re.compile(r"n.?vite|invite|invitation", re.I)),
+        page.locator("[role='button']").filter(
+            has_text=re.compile(r"n.?vite|invite|invitation", re.I)
+        ),
     ]:
         if await locator.count():
-            try:
-                await locator.first.click(timeout=5000)
-                await page.wait_for_timeout(1500)
-                return
-            except Exception:
-                pass
+            for i in range(min(await locator.count(), 10)):
+                try:
+                    await locator.nth(i).click(timeout=4000)
+                    await page.wait_for_timeout(1500)
+                    body = norm(await page.locator("body").inner_text())
+                    if re.search(r"n.?vite|invite|invitation", body, re.I):
+                        return
+                except Exception:
+                    pass
 
+    # We couldn't identify the control. Capture the live authenticated page so
+    # the next refinement can use the exact DOM rather than guessing.
+    await discover(page)
     raise RuntimeError(
-        "Could not locate NInvite in the current Naukri UI. "
-        "Run python agent.py --discover and inspect data/debug/."
+        "Could not locate NInvite in your authenticated Naukri UI. "
+        "The agent saved data/debug/page.png and page.html. "
+        "Send the terminal output plus those debug files so the exact selector can be added."
     )
-
 
 async def discover(page):
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
