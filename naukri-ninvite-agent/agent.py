@@ -13,19 +13,18 @@ from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.naukri.com/"
 PROFILE_DIR = Path(os.getenv("NAUKRI_PROFILE_DIR", ".naukri-browser"))
-STATE_FILE = Path(os.getenv("NINVITE_STATE_FILE", "data/seen_invites.json"))
+STATE_FILE = Path(os.getenv("NAUKRI_JOBS_STATE_FILE", os.getenv("NINVITE_STATE_FILE", "data/seen_jobs.json")))
 DEBUG_DIR = Path("data/debug")
 RECIPIENT = os.getenv("NINVITE_EMAIL_TO", "Harsh.nid@gmail.com")
 
 
 @dataclass
-class Invite:
+class Job:
     key: str
     title: str
     company: str
     location: str
     date: str
-    recruiter: str
     details: str
     source_url: str
 
@@ -34,7 +33,7 @@ def norm(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip()
 
 
-def invite_key(*parts: str) -> str:
+def job_key(*parts: str) -> str:
     raw = "|".join(norm(p).lower() for p in parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
@@ -90,54 +89,42 @@ async def wait_for_login(page):
     raise RuntimeError("Timed out waiting for a logged-in Naukri session.")
 
 
-async def open_ninvite(page):
-    # Naukri's authenticated navigation can differ by account/session and can be
-    # rendered as buttons, links, menus, or cards. First expose the live UI.
+async def open_jobs(page):
     await page.wait_for_timeout(2500)
 
-    # Try the common Jobs entry points.
-    await click_text(page, [
-        "Jobs", "Jobs & Responses", "My Jobs", "Job Responses"
-    ])
-
-    await page.wait_for_timeout(1500)
-
-    # Try visible NInvite variants.
     clicked = await click_text(page, [
-        "NInvite", "NVite", "N Invites", "NInvite list",
-        "NInvite List", "Invites", "Recruiter Invites",
-        "Recruiter Invitations", "Invitations"
+        "Jobs",
+        "Jobs & Responses",
+        "My Jobs",
+        "Job Recommendations",
     ])
+
     if clicked:
+        print(f"Opened Naukri section: {clicked}")
+        await page.wait_for_timeout(2500)
         return
 
-    # Try links/buttons whose visible text contains an invite-like term.
+    # Fallback: find a visible navigation link/button containing Jobs.
     for locator in [
-        page.locator("a").filter(has_text=re.compile(r"n.?vite|invite|invitation", re.I)),
-        page.locator("button").filter(has_text=re.compile(r"n.?vite|invite|invitation", re.I)),
-        page.locator("[role='button']").filter(
-            has_text=re.compile(r"n.?vite|invite|invitation", re.I)
-        ),
+        page.locator("a").filter(has_text=re.compile(r"^\s*jobs\s*$|jobs", re.I)),
+        page.locator("button").filter(has_text=re.compile(r"^\s*jobs\s*$|jobs", re.I)),
+        page.locator("[role='button']").filter(has_text=re.compile(r"jobs", re.I)),
     ]:
-        if await locator.count():
-            for i in range(min(await locator.count(), 10)):
-                try:
-                    await locator.nth(i).click(timeout=4000)
-                    await page.wait_for_timeout(1500)
-                    body = norm(await page.locator("body").inner_text())
-                    if re.search(r"n.?vite|invite|invitation", body, re.I):
-                        return
-                except Exception:
-                    pass
+        count = await locator.count()
+        for i in range(min(count, 15)):
+            try:
+                await locator.nth(i).click(timeout=4000)
+                await page.wait_for_timeout(2500)
+                return
+            except Exception:
+                pass
 
-    # We couldn't identify the control. Capture the live authenticated page so
-    # the next refinement can use the exact DOM rather than guessing.
     await discover(page)
     raise RuntimeError(
-        "Could not locate NInvite in your authenticated Naukri UI. "
-        "The agent saved data/debug/page.png and page.html. "
-        "Send the terminal output plus those debug files so the exact selector can be added."
+        "Could not locate the Jobs option in your authenticated Naukri UI. "
+        "Debug files were saved under data/debug/."
     )
+
 
 async def discover(page):
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,86 +146,139 @@ async def discover(page):
     print(f"\nDebug files saved under {DEBUG_DIR}/")
 
 
-async def extract_invites(page) -> list[Invite]:
-    body_text = norm(await page.locator("body").inner_text())
-    if not re.search(r"n.?vite|invite", body_text, re.I):
-        raise RuntimeError("NInvite page opened, but invitation text was not found.")
+def parse_job_text(txt: str) -> tuple[str, str, str, str]:
+    lines = [norm(x) for x in txt.splitlines() if norm(x)]
 
+    title = lines[0] if lines else "Naukri Job"
+
+    # Common Naukri card pattern: title, company, location, experience/salary,
+    # then metadata. Keep extraction deliberately conservative.
+    company = ""
+    location = ""
+    date = ""
+
+    for line in lines[1:]:
+        low = line.lower()
+        if not company and (
+            "company" in low
+            or "technologies" in low
+            or "limited" in low
+            or "private" in low
+        ):
+            company = line
+        if not location and (
+            "bangalore" in low
+            or "bengaluru" in low
+            or "hyderabad" in low
+            or "pune" in low
+            or "mumbai" in low
+            or "delhi" in low
+            or "noida" in low
+            or "gurgaon" in low
+            or "remote" in low
+            or "india" in low
+        ):
+            location = line
+        if not date and re.search(
+            r"\b(today|yesterday|\d+\s*days?\s*ago|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
+            line,
+            re.I,
+        ):
+            date = line
+
+    return title[:300], company[:300], location[:300], date[:200]
+
+
+async def extract_jobs(page) -> list[Job]:
+    body_text = norm(await page.locator("body").inner_text())
+
+    # Job cards vary across Naukri releases. Start with likely card/list containers
+    # and retain only reasonably sized blocks containing job-like information.
     candidates = page.locator(
         "article, li, tr, [role='row'], [role='listitem'], "
-        ".card, [class*='card'], [class*='invite'], [class*='nvit']"
+        ".jobTuple, .job-tuple, .srpTuple, [class*='jobTuple'], "
+        "[class*='job-tuple'], [class*='jobCard'], [class*='job-card'], "
+        "[class*='joblist'], [class*='job-list']"
     )
 
     rows = []
-    for i in range(min(await candidates.count(), 300)):
+    for i in range(min(await candidates.count(), 500)):
         try:
             txt = norm(await candidates.nth(i).inner_text(timeout=1500))
         except Exception:
             continue
-        if 20 <= len(txt) <= 2500 and re.search(r"n.?vite|invite|recruit|job", txt, re.I):
+
+        if not (30 <= len(txt) <= 3000):
+            continue
+
+        # Avoid nav/header/footer noise. Job cards usually contain at least
+        # one job-oriented signal.
+        if re.search(
+            r"\b(experience|yrs?|salary|lpa|apply|job description|skills|location|"
+            r"remote|work from home|posted|days? ago)\b",
+            txt,
+            re.I,
+        ):
             rows.append(txt)
 
     unique = []
     seen_text = set()
     for txt in rows:
-        if txt.lower() not in seen_text:
-            seen_text.add(txt.lower())
+        normalized = txt.lower()
+        if normalized not in seen_text:
+            seen_text.add(normalized)
             unique.append(txt)
 
-    invites = []
+    jobs = []
     for txt in unique:
-        lines = [norm(x) for x in txt.splitlines() if norm(x)]
-        title = lines[0] if lines else "NInvite"
-        company = next((x for x in lines[1:] if "company" in x.lower()), "")
-        location = next((x for x in lines[1:] if "location" in x.lower()), "")
-        date = next(
-            (x for x in lines if re.search(
-                r"\b(today|yesterday|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
-                x, re.I
-            )), ""
-        )
-        recruiter = next(
-            (x for x in lines if "recruit" in x.lower() or "hiring" in x.lower()),
-            ""
-        )
+        title, company, location, date = parse_job_text(txt)
+        if title.lower() in {"jobs", "job recommendations", "search jobs"}:
+            continue
 
-        invites.append(Invite(
-            key=invite_key(title, company, location, date, txt),
-            title=title[:300],
-            company=company[:300],
-            location=location[:300],
-            date=date[:200],
-            recruiter=recruiter[:300],
-            details=txt[:2500],
+        jobs.append(Job(
+            key=job_key(title, company, location, date, txt),
+            title=title,
+            company=company,
+            location=location,
+            date=date,
+            details=txt[:3000],
             source_url=page.url,
         ))
 
-    return invites
+    # If the page contains no detectable cards, save the authenticated page
+    # rather than silently reporting zero jobs.
+    if not jobs:
+        await discover(page)
+        raise RuntimeError(
+            "The Jobs tab opened, but no job cards could be detected. "
+            "Debug files were saved under data/debug/ so the selectors can be refined."
+        )
+
+    return jobs
 
 
-def send_email(invites: list[Invite]):
+def send_email(jobs: list[Job]):
     host = os.environ["SMTP_HOST"]
     port = int(os.getenv("SMTP_PORT", "465"))
     username = os.environ["SMTP_USERNAME"]
     password = os.environ["SMTP_PASSWORD"]
 
-    if invites:
-        subject = f"Naukri: {len(invites)} new NInvite(s)"
-        body = ["New Naukri NInvite(s) found:", ""]
-        for i, inv in enumerate(invites, 1):
+    if jobs:
+        subject = f"Naukri: {len(jobs)} new job(s)"
+        body = ["New job listing(s) found in the Naukri Jobs tab:", ""]
+        for i, job in enumerate(jobs, 1):
             body += [
-                f"{i}. {inv.title}",
-                f"Company: {inv.company or 'Not detected'}",
-                f"Location: {inv.location or 'Not detected'}",
-                f"Date: {inv.date or 'Not detected'}",
-                f"Recruiter: {inv.recruiter or 'Not detected'}",
-                f"Details: {inv.details}",
-                f"Link: {inv.source_url}",
+                f"{i}. {job.title}",
+                f"Company: {job.company or 'Not detected'}",
+                f"Location: {job.location or 'Not detected'}",
+                f"Posted: {job.date or 'Not detected'}",
+                f"Details: {job.details}",
+                f"Jobs page: {job.source_url}",
                 "",
             ]
     else:
-        subject = "Naukri NInvite check: No new NInvite"
-        body = ["No new NInvite was found during this check."]
+        subject = "Naukri Jobs check: No new jobs"
+        body = ["No new jobs were found in the Naukri Jobs tab during this check."]
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -270,18 +310,20 @@ async def main(discover_only=False):
                 await discover(page)
                 return
 
-            await open_ninvite(page)
+            await open_jobs(page)
             await page.wait_for_timeout(2000)
 
-            invites = await extract_invites(page)
+            jobs = await extract_jobs(page)
             seen = load_seen()
-            new_invites = [x for x in invites if x.key not in seen]
+            new_jobs = [x for x in jobs if x.key not in seen]
 
-            print(f"Found {len(invites)} invitation candidate(s); {len(new_invites)} new.")
+            print(f"Found {len(jobs)} job listing(s); {len(new_jobs)} new.")
 
-            send_email(new_invites)
+            # Only update state after email succeeds, so a failed notification
+            # does not cause jobs to be lost on the next run.
+            send_email(new_jobs)
 
-            seen.update(x.key for x in invites)
+            seen.update(x.key for x in jobs)
             save_seen(seen)
             print("Notification sent and state updated.")
         finally:
